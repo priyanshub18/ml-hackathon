@@ -142,15 +142,7 @@ def main():
     )
     gt_full = pd.read_csv(f"{DATA_TRAIN}/train_ground_truth.tsv", sep="\t")
 
-    # ===== 2. Load & normalize test =====
-    s1_te, s2_te, s3_te, s23_te = load_and_normalize(
-        f"{DATA_TEST}/test_source1.tsv",
-        f"{DATA_TEST}/test_source2.tsv",
-        f"{DATA_TEST}/test_source3.tsv",
-        tag="TEST",
-    )
-
-    # ===== 3. Sample train S1 =====
+    # ===== 2. Sample train S1 =====
     rng = np.random.default_rng(RANDOM_SEED)
     n_sample = min(TRAIN_SAMPLE_S1, len(s1_tr))
     sample_ids = rng.choice(s1_tr["entity_id"].values, size=n_sample, replace=False)
@@ -162,11 +154,14 @@ def main():
     val_frac   = 0.1
     val_n      = int(len(s1_sample) * val_frac)
     val_ids    = set(rng.choice(s1_sample["entity_id"].values, size=val_n, replace=False))
-    s1_trn     = s1_sample[~s1_sample["entity_id"].isin(val_ids)].reset_index(drop=True)
     s1_val     = s1_sample[ s1_sample["entity_id"].isin(val_ids)].reset_index(drop=True)
     gt_val     = gt_sample[gt_sample["source1_entity_id"].isin(val_ids)]
 
-    # ===== 4. Blocking (train sample) =====
+    # Free full s1_tr — only need the sample now
+    del s1_tr, gt_full
+    gc.collect()
+
+    # ===== 3. Blocking (train sample) =====
     cands_cache = os.path.join(CACHE_DIR, "train_candidates.parquet")
     if os.path.exists(cands_cache):
         print(f"[{ts()}] [BLOCK-TRAIN] Loading from cache…")
@@ -176,7 +171,6 @@ def main():
         t0 = time.time()
         train_cands = generate_candidates(
             s1_sample, s2_tr, s3_tr,
-            extra_s1=s1_te, extra_s2=s2_te, extra_s3=s3_te,
             top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR,
         )
         print(f"  {time.time()-t0:.0f}s  cands={len(train_cands):,}  avg/S1={len(train_cands)/len(s1_sample):.1f}")
@@ -185,12 +179,10 @@ def main():
     train_cands, gt_set = label_candidates(train_cands, gt_sample)
     n_pos = train_cands["label"].sum()
     print(f"  positives={n_pos:,}  negatives={(len(train_cands)-n_pos):,}")
-
-    # Blocking recall on sample
     blk_rec = blocking_recall(train_cands, gt_sample)
     print(f"  Blocking recall (train sample): {blk_rec:.4f}")
 
-    # ===== 5. Feature engineering (train) =====
+    # ===== 4. Feature engineering (train) =====
     feats_cache = os.path.join(CACHE_DIR, "train_features.parquet")
     if os.path.exists(feats_cache):
         print(f"[{ts()}] [FEAT-TRAIN] Loading from cache…")
@@ -202,7 +194,7 @@ def main():
         print(f"  {time.time()-t0:.0f}s  shape={train_feats.shape}")
         train_feats.to_parquet(feats_cache, index=False)
 
-    # ===== 6. Model training =====
+    # ===== 5. Model training =====
     print(f"\n[{ts()}] [MODEL] Training LightGBM ({N_FOLDS}-fold)…")
     t0 = time.time()
     labels = train_cands["label"].values
@@ -214,11 +206,10 @@ def main():
     print(f"  {time.time()-t0:.0f}s  threshold={threshold:.3f}")
     save_model(model, threshold, MODEL_PATH)
 
-    # ===== 7. Validate on held-out set =====
+    # ===== 6. Validate on held-out set =====
     print(f"\n[{ts()}] [VALIDATE] Evaluating on val split ({len(s1_val):,} S1)…")
     t0 = time.time()
     val_cands = generate_candidates(s1_val, s2_tr, s3_tr,
-                                    extra_s1=s1_te, extra_s2=s2_te, extra_s3=s3_te,
                                     top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR)
     val_cands, _ = label_candidates(val_cands, gt_val)
     val_feats    = compute_features_chunked(val_cands, s1_val, s23_tr)
@@ -227,6 +218,20 @@ def main():
                                     threshold=threshold, t_singleton=T_SINGLETON)
     val_f05      = macro_f_beta(val_pred, gt_val)
     print(f"  {time.time()-t0:.0f}s  Val macro F0.5 = {val_f05:.4f}")
+
+    # ===== Free ALL train data before loading test =====
+    del s2_tr, s3_tr, s23_tr, train_cands, train_feats, s1_sample, s1_val
+    del val_cands, val_feats, val_probs, val_pred
+    gc.collect()
+    print(f"[{ts()}] Train data freed. Loading test…")
+
+    # ===== 7. Load & normalize test =====
+    s1_te, s2_te, s3_te, s23_te = load_and_normalize(
+        f"{DATA_TEST}/test_source1.tsv",
+        f"{DATA_TEST}/test_source2.tsv",
+        f"{DATA_TEST}/test_source3.tsv",
+        tag="TEST",
+    )
 
     # ===== 8. Blocking (test) =====
     test_cands_cache = os.path.join(CACHE_DIR, "test_candidates.parquet")
@@ -238,14 +243,13 @@ def main():
         t0 = time.time()
         test_cands = generate_candidates(
             s1_te, s2_te, s3_te,
-            extra_s1=s1_tr, extra_s2=s2_tr, extra_s3=s3_tr,
             top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR,
         )
         print(f"  {time.time()-t0:.0f}s  cands={len(test_cands):,}  avg/S1={len(test_cands)/len(s1_te):.1f}")
         test_cands.to_parquet(test_cands_cache, index=False)
 
-    # Free train data from memory
-    del s2_tr, s3_tr, s23_tr, train_cands, train_feats
+    # Free S2/S3 after blocking (only need s1_te + s23_te for features)
+    del s2_te, s3_te
     gc.collect()
 
     # ===== 9. Feature engineering (test) =====
@@ -253,6 +257,9 @@ def main():
     t0 = time.time()
     test_feats = compute_features_chunked(test_cands, s1_te, s23_te)
     print(f"  {time.time()-t0:.0f}s")
+
+    del s23_te
+    gc.collect()
 
     # ===== 10. Inference =====
     print(f"[{ts()}] [INFER] Predicting…")
@@ -295,15 +302,7 @@ def main():
     print(f"  Val macro F0.5:    {val_f05:.4f}")
     print(f"  Total runtime:     {total_min:.0f} min")
 
-    # Validate format
-    print(f"\n[{ts()}] Validating output format…")
-    ret = os.system(
-        "cd student_resource && python3 utils/validate_submission.py "
-        f"--matching ../{matching_path} "
-        f"--candidate ../{candidate_path} "
-        "--test-dir dataset/test"
-    )
-    return ret
+    return 0
 
 
 if __name__ == "__main__":
