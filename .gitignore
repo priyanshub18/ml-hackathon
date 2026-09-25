@@ -1,1 +1,7 @@
-student_resource
+student_resource/
+output/
+__pycache__/
+*.pyc
+*.pkl
+*.parquet
+.DS_Store

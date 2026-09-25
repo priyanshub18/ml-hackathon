@@ -34,11 +34,30 @@ from evaluate      import macro_f_beta, blocking_recall, reduction_ratio
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DATA_TRAIN  = "student_resource/dataset/train"
-DATA_TEST   = "student_resource/dataset/test"
-OUTPUT_DIR  = "output"
-MODEL_PATH  = "output/model.pkl"
-CACHE_DIR   = "output/cache"
+# Auto-detect Kaggle input path if running on Kaggle
+def _auto_detect_paths():
+    kaggle_input = "/kaggle/input"
+    if not os.path.isdir(kaggle_input):
+        return None, None
+    # Look for train_source1.tsv anywhere under /kaggle/input
+    for root, dirs, files in os.walk(kaggle_input):
+        if "train_source1.tsv" in files:
+            train_dir = root
+            # Guess test dir: sibling folder named 'test'
+            parent = os.path.dirname(root)
+            test_dir = os.path.join(parent, "test")
+            if not os.path.isdir(test_dir):
+                test_dir = root  # fallback: same folder
+            return train_dir, test_dir
+    return None, None
+
+_auto_train, _auto_test = _auto_detect_paths()
+
+DATA_TRAIN  = os.environ.get("DATA_TRAIN",  _auto_train  or "student_resource/dataset/train")
+DATA_TEST   = os.environ.get("DATA_TEST",   _auto_test   or "student_resource/dataset/test")
+OUTPUT_DIR  = os.environ.get("OUTPUT_DIR",  "/kaggle/working" if os.path.isdir("/kaggle/working") else "output")
+MODEL_PATH  = os.path.join(OUTPUT_DIR, "model.pkl")
+CACHE_DIR   = os.path.join(OUTPUT_DIR, "cache")
 
 TRAIN_SAMPLE_S1   = 300_000
 TOP_K_NAME        = 20
