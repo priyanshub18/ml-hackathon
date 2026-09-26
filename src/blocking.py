@@ -1,15 +1,13 @@
 """
 Blocking / candidate generation.
 
-Three passes per country, applied to S2 and S3 combined:
-  1. TF-IDF on normalized NAME  — catches Latin name matches
-  2. TF-IDF on normalized ADDRESS — catches transliteration cases where
-     the address is ASCII even when the name is in a different script
-  3. Numeric-token exact match — house / plot numbers, ZIP, PIN; very precise
-
-MAX_TOTAL caps the total number of candidates per S1 across all passes and
-both sources.  IDF is fit on the union of the corpus supplied + optional extra
-documents so that France test vocabulary is covered.
+Memory-safe sharding strategy:
+  - TF-IDF vectorizer is FIT once on full corpus (cheap — just vocabulary)
+  - S1 is transformed once (small matrix, e.g. 300K × 30K)
+  - S23 is transformed and scored in SHARDS of S23_SHARD_SIZE rows
+    so peak sparse matrix RAM = shard_size × MAX_FEATURES (not full 5M × 80K)
+  - Three passes: name TF-IDF + address TF-IDF + numeric exact match
+  - Results merged across shards, then capped at MAX_TOTAL per S1
 """
 
 import sys, os
@@ -24,27 +22,25 @@ from sklearn.preprocessing import normalize as sk_normalize
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-TOP_K_NAME   = 20    # name TF-IDF top-k per S1 (per source separately)
-TOP_K_ADDR   = 20    # address TF-IDF top-k per S1
-MAX_NUMERIC  = 30    # max numeric-match candidates per S1
-MAX_TOTAL    = 100   # hard cap on TOTAL candidates per S1 (across S2+S3)
-MAX_FEATURES = 80_000
-MIN_DF       = 2
-BATCH_SIZE   = 3_000       # S1 rows per batch for sparse matrix multiply
-MIN_TFIDF_SCORE   = 0.05   # discard very low cosine pairs
-MIN_NUMERIC_LEN   = 3      # ignore 1- and 2-digit numbers
-MAX_NUMERIC_DOCFREQ = 500  # skip tokens that appear in > N S23 records
+TOP_K_NAME        = 20      # name TF-IDF top-k per S1 (per source)
+TOP_K_ADDR        = 20      # address TF-IDF top-k per S1
+MAX_NUMERIC       = 30      # max numeric-match candidates per S1
+MAX_TOTAL         = 100     # hard cap on TOTAL candidates per S1 (across S2+S3)
+MAX_FEATURES      = 30_000  # reduced from 80K → smaller sparse matrices
+MIN_DF            = 3       # raised from 2 → smaller vocabulary
+S23_SHARD_SIZE    = 500_000 # transform S23 in shards to limit peak RAM
+BATCH_SIZE        = 2_000   # S1 rows per batch for dot product
+MIN_TFIDF_SCORE   = 0.05
+MIN_NUMERIC_LEN   = 3
+MAX_NUMERIC_DOCFREQ = 500
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _fit_tfidf(corpus_texts, extra_texts=None, max_features=MAX_FEATURES):
-    """Fit TF-IDF on corpus_texts + optional extra_texts."""
-    texts = list(corpus_texts)
-    if extra_texts is not None and len(extra_texts) > 0:
-        texts.extend(extra_texts)
+def _fit_tfidf(corpus_texts, max_features=MAX_FEATURES):
+    """Fit TF-IDF vectorizer on corpus_texts. Returns fitted vectorizer."""
     vect = TfidfVectorizer(
         analyzer="word",
         ngram_range=(1, 2),
@@ -53,91 +49,105 @@ def _fit_tfidf(corpus_texts, extra_texts=None, max_features=MAX_FEATURES):
         sublinear_tf=True,
         dtype=np.float32,
     )
-    vect.fit(texts)
+    vect.fit(corpus_texts)
     return vect
 
 
-def _sparse_topk_with_scores(s1_mat, s23_mat, k, batch_size=BATCH_SIZE):
+def _sparse_topk_batch(s1_csr, s23_shard_csr, k, s23_offset, batch_size=BATCH_SIZE):
     """
-    For each row in s1_mat, find top-k rows in s23_mat by cosine similarity
-    (both matrices must be L2-normalised).
-
-    Returns list of (s1_i, s23_i, score) triples.
+    Dot-product top-k for one S23 shard.
+    Returns list of (s1_i, s23_global_j, score).
+    s23_offset: index offset to convert shard-local j to global j.
     """
-    n_s1 = s1_mat.shape[0]
+    n_s1 = s1_csr.shape[0]
     results = []
-
-    s1_csr  = s1_mat.tocsr()
-    s23_csr = s23_mat.tocsr()
 
     for start in range(0, n_s1, batch_size):
         end   = min(start + batch_size, n_s1)
-        batch = s1_csr[start:end]           # (batch_sz, vocab)
-        scores = batch.dot(s23_csr.T)       # (batch_sz, n_s23) — sparse
-        scores_csr = scores.tocsr()
+        batch = s1_csr[start:end]
+        scores = batch.dot(s23_shard_csr.T).tocsr()
 
-        for local_i in range(scores_csr.shape[0]):
-            rs = scores_csr.indptr[local_i]
-            re = scores_csr.indptr[local_i + 1]
-            cols = scores_csr.indices[rs:re]
-            vals = scores_csr.data[rs:re]
+        for local_i in range(scores.shape[0]):
+            rs = scores.indptr[local_i]
+            re = scores.indptr[local_i + 1]
+            cols = scores.indices[rs:re]
+            vals = scores.data[rs:re]
 
-            # Filter by minimum score first
             mask = vals >= MIN_TFIDF_SCORE
-            cols = cols[mask]
-            vals = vals[mask]
-
+            cols, vals = cols[mask], vals[mask]
             if len(cols) == 0:
                 continue
+
             if len(cols) > k:
-                top_local = np.argpartition(-vals, k)[:k]
-                cols = cols[top_local]
-                vals = vals[top_local]
+                top_idx = np.argpartition(-vals, k)[:k]
+                cols, vals = cols[top_idx], vals[top_idx]
 
             s1_global = start + local_i
             for c, v in zip(cols, vals):
-                results.append((s1_global, int(c), float(v)))
+                results.append((s1_global, int(c) + s23_offset, float(v)))
 
     return results
 
 
-def _tfidf_pass(s1_df, s23_df, field, k,
-                extra_texts_s1=None, extra_texts_s23=None):
+def _tfidf_pass_sharded(s1_df, s23_df, field, k):
     """
-    TF-IDF blocking pass on a single field column.
-    Returns list of (s1_idx, s23_idx, score).
+    TF-IDF blocking pass, processing S23 in memory-safe shards.
+
+    Fits vectorizer on full corpus (cheap), transforms S1 once,
+    then transforms S23 in chunks of S23_SHARD_SIZE rows.
+
+    Returns list of (s1_idx, s23_idx, score) — s23_idx is global row index.
     """
-    s1_text  = s1_df[field].fillna("").astype(str)
-    s23_text = s23_df[field].fillna("").astype(str)
+    s1_text  = s1_df[field].fillna("").astype(str).tolist()
+    s23_text = s23_df[field].fillna("").astype(str).tolist()
 
-    extra = None
-    if extra_texts_s1 is not None and extra_texts_s23 is not None:
-        extra = list(extra_texts_s1) + list(extra_texts_s23)
+    # Fit on full corpus — just builds vocabulary, not matrices
+    vect = _fit_tfidf(s1_text + s23_text)
 
-    vect    = _fit_tfidf(pd.concat([s1_text, s23_text]), extra)
-    s1_mat  = sk_normalize(vect.transform(s1_text),  norm="l2")
-    s23_mat = sk_normalize(vect.transform(s23_text), norm="l2")
+    # Transform S1 once (small)
+    s1_mat = sk_normalize(vect.transform(s1_text), norm="l2").tocsr()
 
-    return _sparse_topk_with_scores(s1_mat, s23_mat, k)
+    # Per-(s1_i) accumulate best-k across all shards
+    best_per_s1 = defaultdict(list)   # s1_i → [(s23_global_j, score)]
+
+    n_s23 = len(s23_text)
+    for shard_start in range(0, n_s23, S23_SHARD_SIZE):
+        shard_end  = min(shard_start + S23_SHARD_SIZE, n_s23)
+        shard_text = s23_text[shard_start:shard_end]
+
+        shard_mat = sk_normalize(vect.transform(shard_text), norm="l2").tocsr()
+        triples   = _sparse_topk_batch(s1_mat, shard_mat, k, shard_start)
+
+        for s1_i, s23_j, sc in triples:
+            best_per_s1[s1_i].append((s23_j, sc))
+
+        del shard_mat  # free shard matrix immediately
+
+    # Merge: keep global top-k per S1
+    results = []
+    for s1_i, pairs in best_per_s1.items():
+        if len(pairs) > k:
+            pairs.sort(key=lambda x: -x[1])
+            pairs = pairs[:k]
+        for s23_j, sc in pairs:
+            results.append((s1_i, s23_j, sc))
+
+    return results
 
 
 def _numeric_pass(s1_df, s23_df, max_per_s1=MAX_NUMERIC,
                   min_len=MIN_NUMERIC_LEN, max_df=MAX_NUMERIC_DOCFREQ):
     """
-    Exact numeric-token match.  Only uses tokens that are:
-      - long enough (≥ min_len digits) to be discriminative
-      - rare enough (appears in ≤ max_df S23 records) to avoid noise
-
+    Exact numeric-token match with inverted index.
+    Only uses tokens that are long enough and rare enough to be discriminative.
     Returns list of (s1_idx, s23_idx, token_count).
     """
-    # Document frequency of each token in S23
     doc_freq = defaultdict(int)
     for tokens in s23_df["numeric_tokens"]:
         for tok in tokens:
             if len(tok) >= min_len:
                 doc_freq[tok] += 1
 
-    # Inverted index for discriminative tokens only
     inv_index = defaultdict(list)
     for j, tokens in enumerate(s23_df["numeric_tokens"]):
         for tok in tokens:
@@ -163,7 +173,6 @@ def _numeric_pass(s1_df, s23_df, max_per_s1=MAX_NUMERIC,
 # Public API
 # ---------------------------------------------------------------------------
 
-
 def generate_candidates(
     s1_df: pd.DataFrame,
     s2_df: pd.DataFrame,
@@ -176,58 +185,55 @@ def generate_candidates(
     """
     Produce candidate (S1, S2/S3) pairs for scoring.
 
-    Passes: name TF-IDF + address TF-IDF + numeric exact match, per country.
-    MAX_TOTAL caps total candidates per S1 entity across all sources / passes.
+    Memory-safe: S23 TF-IDF transform is sharded so peak matrix RAM
+    = S23_SHARD_SIZE × MAX_FEATURES (not full corpus size).
 
     Parameters
     ----------
-    s1_df, s2_df, s3_df : normalized DataFrames (entity_id, norm_name,
-        norm_addr, numeric_tokens, country are required).
-    gt_pairs : optional set of (s1_entity_id, s23_entity_id) ground-truth
-        pairs — used to print per-pass recall for analysis.
+    s1_df, s2_df, s3_df : normalized DataFrames with entity_id, country,
+        norm_name, norm_addr, numeric_tokens columns.
+    gt_pairs : optional set of (s1_id, s23_id) for per-pass recall logging.
 
     Returns
     -------
     DataFrame: source1_entity_id, candidate_id, name_score, addr_score,
-               numeric_match, source (S2/S3)
+               numeric_match, source
     """
     all_pairs = []
     countries = s1_df["country"].unique()
 
-    # Accumulators for global per-pass recall tracking
-    after_name_pairs  = set()
-    after_addr_pairs  = set()
-    after_num_pairs   = set()
+    after_name_pairs = set()
+    after_addr_pairs = set()
+    after_num_pairs  = set()
 
     for country in countries:
         if verbose:
-            print(f"  [blocking] country={country}")
+            print(f"  [blocking] country={country}", flush=True)
 
-        s1_c  = s1_df[s1_df["country"] == country].reset_index(drop=True)
-        s2_c  = s2_df[s2_df["country"] == country].reset_index(drop=True)
-        s3_c  = s3_df[s3_df["country"] == country].reset_index(drop=True)
+        s1_c = s1_df[s1_df["country"] == country].reset_index(drop=True)
+        s2_c = s2_df[s2_df["country"] == country].reset_index(drop=True)
+        s3_c = s3_df[s3_df["country"] == country].reset_index(drop=True)
 
         if len(s1_c) == 0:
             continue
 
-        # Run passes for each source separately to keep matrices manageable
-        source_results = {}   # source → dict[(s1_i, s23_i)] → (name_sc, addr_sc, num_match)
+        source_results = {}
 
         for src_name, s23_c in [("S2", s2_c), ("S3", s3_c)]:
             if len(s23_c) == 0:
                 continue
             if verbose:
-                print(f"    {src_name}: {len(s1_c):,} S1 × {len(s23_c):,} {src_name}")
+                print(f"    {src_name}: {len(s1_c):,} S1 × {len(s23_c):,} {src_name}", flush=True)
 
-            name_triples = _tfidf_pass(s1_c, s23_c, "norm_name", top_k_name)
-            addr_triples = _tfidf_pass(s1_c, s23_c, "norm_addr", top_k_addr)
+            name_triples = _tfidf_pass_sharded(s1_c, s23_c, "norm_name", top_k_name)
+            addr_triples = _tfidf_pass_sharded(s1_c, s23_c, "norm_addr", top_k_addr)
             num_triples  = _numeric_pass(s1_c, s23_c)
 
-            name_map = {(i, j): sc for i, j, sc in name_triples}
-            addr_map = {(i, j): sc for i, j, sc in addr_triples}
+            name_map = {(i, j): sc  for i, j, sc  in name_triples}
+            addr_map = {(i, j): sc  for i, j, sc  in addr_triples}
             num_map  = {(i, j): cnt for i, j, cnt in num_triples}
 
-            # Track per-pass entity-id pairs for recall logging
+            # Per-pass recall tracking
             if gt_pairs is not None:
                 for (i, j) in name_map:
                     after_name_pairs.add((s1_c.iloc[i]["entity_id"], s23_c.iloc[j]["entity_id"]))
@@ -249,7 +255,7 @@ def generate_candidates(
 
             source_results[src_name] = pair_info
 
-        # Merge S2 and S3 results, then cap per S1
+        # Merge S2 + S3, apply global cap per S1
         s1_buckets = defaultdict(list)
         for src_name, pair_info in source_results.items():
             for (i, s23_id), (n_sc, a_sc, num, combined, src) in pair_info.items():
@@ -269,17 +275,17 @@ def generate_candidates(
                     "source":            src,
                 })
 
-    # Print per-pass recall summary
-    if gt_pairs is not None and verbose:
-        total_gt = len(gt_pairs)
+    # Per-pass recall summary
+    if gt_pairs is not None and verbose and gt_pairs:
+        total = len(gt_pairs)
         def _r(pairs):
             n = len(gt_pairs & pairs)
-            return f"{n}/{total_gt} = {n/total_gt:.4f}" if total_gt else "N/A"
+            return f"{n}/{total} = {n/total:.4f}"
         print(f"\n  === Blocking Recall by Pass ===")
         print(f"  After name  TF-IDF : {_r(after_name_pairs)}")
-        print(f"  After addr  TF-IDF : {_r(after_addr_pairs)}  (+addr contribution)")
-        print(f"  After numeric match: {_r(after_num_pairs)}  (+numeric contribution)")
-        print(f"  MAX_TOTAL cap={MAX_TOTAL}  (applied after union of all passes)")
+        print(f"  After + addr TF-IDF: {_r(after_addr_pairs)}")
+        print(f"  After + numeric    : {_r(after_num_pairs)}")
+        print(f"  MAX_TOTAL={MAX_TOTAL}  shard={S23_SHARD_SIZE:,}  features={MAX_FEATURES:,}")
 
     if not all_pairs:
         return pd.DataFrame(columns=[
@@ -288,7 +294,6 @@ def generate_candidates(
         ])
 
     df = pd.DataFrame(all_pairs)
-    # Final dedup (shouldn't be needed but safeguard)
     df["_combined"] = df["name_score"] + df["addr_score"] + df["numeric_match"].astype(float)
     df = (df.sort_values("_combined", ascending=False)
             .drop_duplicates(subset=["source1_entity_id", "candidate_id"])
