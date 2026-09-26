@@ -27,7 +27,7 @@ from sklearn.preprocessing import normalize as sk_normalize
 TOP_K_NAME   = 20    # name TF-IDF top-k per S1 (per source separately)
 TOP_K_ADDR   = 20    # address TF-IDF top-k per S1
 MAX_NUMERIC  = 30    # max numeric-match candidates per S1
-MAX_TOTAL    = 50    # hard cap on TOTAL candidates per S1 (across S2+S3)
+MAX_TOTAL    = 100   # hard cap on TOTAL candidates per S1 (across S2+S3)
 MAX_FEATURES = 80_000
 MIN_DF       = 2
 BATCH_SIZE   = 3_000       # S1 rows per batch for sparse matrix multiply
@@ -163,16 +163,15 @@ def _numeric_pass(s1_df, s23_df, max_per_s1=MAX_NUMERIC,
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def generate_candidates(
     s1_df: pd.DataFrame,
     s2_df: pd.DataFrame,
     s3_df: pd.DataFrame,
-    extra_s1: pd.DataFrame = None,
-    extra_s2: pd.DataFrame = None,
-    extra_s3: pd.DataFrame = None,
     top_k_name: int = TOP_K_NAME,
     top_k_addr: int = TOP_K_ADDR,
     verbose: bool = True,
+    gt_pairs: set = None,
 ) -> pd.DataFrame:
     """
     Produce candidate (S1, S2/S3) pairs for scoring.
@@ -184,7 +183,8 @@ def generate_candidates(
     ----------
     s1_df, s2_df, s3_df : normalized DataFrames (entity_id, norm_name,
         norm_addr, numeric_tokens, country are required).
-    extra_s1/s2/s3 : optional data used ONLY to enrich IDF statistics.
+    gt_pairs : optional set of (s1_entity_id, s23_entity_id) ground-truth
+        pairs — used to print per-pass recall for analysis.
 
     Returns
     -------
@@ -193,6 +193,11 @@ def generate_candidates(
     """
     all_pairs = []
     countries = s1_df["country"].unique()
+
+    # Accumulators for global per-pass recall tracking
+    after_name_pairs  = set()
+    after_addr_pairs  = set()
+    after_num_pairs   = set()
 
     for country in countries:
         if verbose:
@@ -205,46 +210,39 @@ def generate_candidates(
         if len(s1_c) == 0:
             continue
 
-        # Optional IDF extras
-        ex_s1_texts  = extra_s1[extra_s1["country"] == country]["norm_name"].fillna("").astype(str).tolist() if extra_s1 is not None else None
-        ex_s2n_texts = extra_s2[extra_s2["country"] == country]["norm_name"].fillna("").astype(str).tolist() if extra_s2 is not None else None
-        ex_s3n_texts = extra_s3[extra_s3["country"] == country]["norm_name"].fillna("").astype(str).tolist() if extra_s3 is not None else None
-        ex_s2a_texts = extra_s2[extra_s2["country"] == country]["norm_addr"].fillna("").astype(str).tolist() if extra_s2 is not None else None
-        ex_s3a_texts = extra_s3[extra_s3["country"] == country]["norm_addr"].fillna("").astype(str).tolist() if extra_s3 is not None else None
-
         # Run passes for each source separately to keep matrices manageable
         source_results = {}   # source → dict[(s1_i, s23_i)] → (name_sc, addr_sc, num_match)
 
-        for src_name, s23_c, ex_s23n, ex_s23a in [
-            ("S2", s2_c, ex_s2n_texts, ex_s2a_texts),
-            ("S3", s3_c, ex_s3n_texts, ex_s3a_texts),
-        ]:
+        for src_name, s23_c in [("S2", s2_c), ("S3", s3_c)]:
             if len(s23_c) == 0:
                 continue
             if verbose:
                 print(f"    {src_name}: {len(s1_c):,} S1 × {len(s23_c):,} {src_name}")
 
-            ex_s1_n = ex_s1_texts
-            ex_s1_a = (extra_s1[extra_s1["country"] == country]["norm_addr"].fillna("").astype(str).tolist()
-                       if extra_s1 is not None else None)
-
-            name_triples = _tfidf_pass(s1_c, s23_c, "norm_name", top_k_name,
-                                       extra_texts_s1=ex_s1_n, extra_texts_s23=ex_s23n)
-            addr_triples = _tfidf_pass(s1_c, s23_c, "norm_addr", top_k_addr,
-                                       extra_texts_s1=ex_s1_a, extra_texts_s23=ex_s23a)
+            name_triples = _tfidf_pass(s1_c, s23_c, "norm_name", top_k_name)
+            addr_triples = _tfidf_pass(s1_c, s23_c, "norm_addr", top_k_addr)
             num_triples  = _numeric_pass(s1_c, s23_c)
 
             name_map = {(i, j): sc for i, j, sc in name_triples}
             addr_map = {(i, j): sc for i, j, sc in addr_triples}
             num_map  = {(i, j): cnt for i, j, cnt in num_triples}
 
+            # Track per-pass entity-id pairs for recall logging
+            if gt_pairs is not None:
+                for (i, j) in name_map:
+                    after_name_pairs.add((s1_c.iloc[i]["entity_id"], s23_c.iloc[j]["entity_id"]))
+                for (i, j) in set(name_map) | set(addr_map):
+                    after_addr_pairs.add((s1_c.iloc[i]["entity_id"], s23_c.iloc[j]["entity_id"]))
+                for (i, j) in set(name_map) | set(addr_map) | set(num_map):
+                    after_num_pairs.add((s1_c.iloc[i]["entity_id"], s23_c.iloc[j]["entity_id"]))
+
             all_keys = set(name_map) | set(addr_map) | set(num_map)
 
             pair_info = {}
             for (i, j) in all_keys:
-                n_sc  = name_map.get((i, j), 0.0)
-                a_sc  = addr_map.get((i, j), 0.0)
-                n_cnt = num_map.get((i, j), 0)
+                n_sc     = name_map.get((i, j), 0.0)
+                a_sc     = addr_map.get((i, j), 0.0)
+                n_cnt    = num_map.get((i, j), 0)
                 combined = n_sc + a_sc + min(n_cnt, 5) * 0.1
                 s23_id   = s23_c.iloc[j]["entity_id"]
                 pair_info[(i, s23_id)] = (n_sc, a_sc, int((i, j) in num_map), combined, src_name)
@@ -252,14 +250,12 @@ def generate_candidates(
             source_results[src_name] = pair_info
 
         # Merge S2 and S3 results, then cap per S1
-        # Build: s1_idx → list of (s23_id, name_sc, addr_sc, num, combined, src)
         s1_buckets = defaultdict(list)
         for src_name, pair_info in source_results.items():
             for (i, s23_id), (n_sc, a_sc, num, combined, src) in pair_info.items():
                 s1_buckets[i].append((s23_id, n_sc, a_sc, num, combined, src))
 
         for i, cand_list in s1_buckets.items():
-            # Sort by combined score descending, apply global cap
             cand_list.sort(key=lambda x: -x[4])
             cand_list = cand_list[:MAX_TOTAL]
             s1_id = s1_c.iloc[i]["entity_id"]
@@ -272,6 +268,18 @@ def generate_candidates(
                     "numeric_match":     num,
                     "source":            src,
                 })
+
+    # Print per-pass recall summary
+    if gt_pairs is not None and verbose:
+        total_gt = len(gt_pairs)
+        def _r(pairs):
+            n = len(gt_pairs & pairs)
+            return f"{n}/{total_gt} = {n/total_gt:.4f}" if total_gt else "N/A"
+        print(f"\n  === Blocking Recall by Pass ===")
+        print(f"  After name  TF-IDF : {_r(after_name_pairs)}")
+        print(f"  After addr  TF-IDF : {_r(after_addr_pairs)}  (+addr contribution)")
+        print(f"  After numeric match: {_r(after_num_pairs)}  (+numeric contribution)")
+        print(f"  MAX_TOTAL cap={MAX_TOTAL}  (applied after union of all passes)")
 
     if not all_pairs:
         return pd.DataFrame(columns=[

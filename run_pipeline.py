@@ -189,11 +189,22 @@ def main():
         s2_tr_blk = pd.read_parquet(norm["s2_tr"], columns=BLOCK_COLS)
         s3_tr_blk = pd.read_parquet(norm["s3_tr"], columns=BLOCK_COLS)
 
+        # Build gt_pairs set for recall-per-pass logging
+        gt_pairs_set = set()
+        for row in gt_sample.itertuples(index=False):
+            if pd.isna(row.matched_entity_ids) or not str(row.matched_entity_ids).strip():
+                continue
+            for mid in str(row.matched_entity_ids).split(","):
+                mid = mid.strip()
+                if mid:
+                    gt_pairs_set.add((row.source1_entity_id, mid))
+
         print(f"[{ts()}] [BLOCK-TRAIN] Generating candidates…")
         t0 = time.time()
         train_cands = generate_candidates(
             s1_sample[BLOCK_COLS], s2_tr_blk, s3_tr_blk,
             top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR,
+            gt_pairs=gt_pairs_set,
         )
         print(f"  {time.time()-t0:.0f}s  cands={len(train_cands):,}  avg/S1={len(train_cands)/len(s1_sample):.1f}")
         train_cands.to_parquet(cands_cache, index=False)
