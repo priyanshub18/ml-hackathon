@@ -194,8 +194,8 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         norm_core, norm_suffix, norm_name  — name columns
         norm_addr, numeric_tokens          — address columns
         is_non_latin                       — flag for non-ASCII name
+    Works in-place (no copy) to save RAM.
     """
-    df = df.copy()
 
     core, suffix, full = normalize_name_series(df["business_name"])
     df["norm_core"]   = core

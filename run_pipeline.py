@@ -185,11 +185,7 @@ def main():
         train_cands = pd.read_parquet(cands_cache)
         val_cands   = pd.read_parquet(val_cands_cache)
     else:
-        print(f"[{ts()}] [BLOCK-TRAIN] Loading S2/S3 for blocking (slim cols)…")
-        s2_tr_blk = pd.read_parquet(norm["s2_tr"], columns=BLOCK_COLS)
-        s3_tr_blk = pd.read_parquet(norm["s3_tr"], columns=BLOCK_COLS)
-
-        # Build gt_pairs set for recall-per-pass logging
+        # Build gt_pairs set for recall logging
         gt_pairs_set = set()
         for row in gt_sample.itertuples(index=False):
             if pd.isna(row.matched_entity_ids) or not str(row.matched_entity_ids).strip():
@@ -199,26 +195,36 @@ def main():
                 if mid:
                     gt_pairs_set.add((row.source1_entity_id, mid))
 
-        print(f"[{ts()}] [BLOCK-TRAIN] Generating candidates…")
+        # Load S2/S3 ONE COUNTRY AT A TIME — never hold 5M+5.3M rows simultaneously
+        countries = s1_sample["country"].unique().tolist()
+        print(f"[{ts()}] [BLOCK-TRAIN] Countries: {countries}")
+        train_parts, val_parts = [], []
         t0 = time.time()
-        train_cands = generate_candidates(
-            s1_sample[BLOCK_COLS], s2_tr_blk, s3_tr_blk,
-            top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR,
-            gt_pairs=gt_pairs_set,
-        )
+        for country in countries:
+            print(f"[{ts()}]   country={country}…", flush=True)
+            s1_c = s1_sample[s1_sample["country"] == country].reset_index(drop=True)
+            s1_v = s1_val[s1_val["country"] == country].reset_index(drop=True)
+            # Predicate pushdown: reads only rows for this country
+            s2_c = pd.read_parquet(norm["s2_tr"], filters=[("country", "==", country)], columns=BLOCK_COLS)
+            s3_c = pd.read_parquet(norm["s3_tr"], filters=[("country", "==", country)], columns=BLOCK_COLS)
+            print(f"    S1={len(s1_c):,}  S2={len(s2_c):,}  S3={len(s3_c):,}", flush=True)
+
+            gt_c = {p for p in gt_pairs_set if p[0] in set(s1_c["entity_id"])}
+            train_parts.append(generate_candidates(
+                s1_c[BLOCK_COLS], s2_c, s3_c,
+                top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR, gt_pairs=gt_c))
+            val_parts.append(generate_candidates(
+                s1_v[BLOCK_COLS], s2_c, s3_c,
+                top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR))
+            del s2_c, s3_c
+            gc.collect()
+
+        train_cands = pd.concat(train_parts, ignore_index=True)
+        val_cands   = pd.concat(val_parts,   ignore_index=True)
         print(f"  {time.time()-t0:.0f}s  cands={len(train_cands):,}  avg/S1={len(train_cands)/len(s1_sample):.1f}")
         train_cands.to_parquet(cands_cache, index=False)
-
-        print(f"[{ts()}] [BLOCK-VAL] Generating candidates…")
-        t0 = time.time()
-        val_cands = generate_candidates(
-            s1_val[BLOCK_COLS], s2_tr_blk, s3_tr_blk,
-            top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR,
-        )
-        print(f"  {time.time()-t0:.0f}s")
         val_cands.to_parquet(val_cands_cache, index=False)
-
-        del s2_tr_blk, s3_tr_blk
+        del train_parts, val_parts
         gc.collect()
 
     train_cands, _ = label_candidates(train_cands, gt_sample)
@@ -289,23 +295,30 @@ def main():
         print(f"[{ts()}] [BLOCK-TEST] Loading from cache…")
         test_cands = pd.read_parquet(test_cands_cache)
     else:
-        print(f"[{ts()}] [BLOCK-TEST] Loading S1/S2/S3 for blocking…")
-        s1_te_blk = pd.read_parquet(norm["s1_te"], columns=BLOCK_COLS)
-        s2_te_blk = pd.read_parquet(norm["s2_te"], columns=BLOCK_COLS)
-        s3_te_blk = pd.read_parquet(norm["s3_te"], columns=BLOCK_COLS)
-
-        print(f"[{ts()}] [BLOCK-TEST] Generating candidates…")
+        # Load one country at a time for test blocking too
+        s1_te_ids  = pd.read_parquet(norm["s1_te"], columns=["entity_id", "country"])
+        countries_te = s1_te_ids["country"].unique().tolist()
+        print(f"[{ts()}] [BLOCK-TEST] Countries: {countries_te}")
+        test_parts = []
         t0 = time.time()
-        test_cands = generate_candidates(
-            s1_te_blk, s2_te_blk, s3_te_blk,
-            top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR,
-        )
-        print(f"  {time.time()-t0:.0f}s  cands={len(test_cands):,}  avg/S1={len(test_cands)/len(s1_te_blk):.1f}")
+        for country in countries_te:
+            print(f"[{ts()}]   country={country}…", flush=True)
+            s1_c = pd.read_parquet(norm["s1_te"], filters=[("country", "==", country)], columns=BLOCK_COLS)
+            s2_c = pd.read_parquet(norm["s2_te"], filters=[("country", "==", country)], columns=BLOCK_COLS)
+            s3_c = pd.read_parquet(norm["s3_te"], filters=[("country", "==", country)], columns=BLOCK_COLS)
+            print(f"    S1={len(s1_c):,}  S2={len(s2_c):,}  S3={len(s3_c):,}", flush=True)
+            test_parts.append(generate_candidates(s1_c, s2_c, s3_c,
+                                                  top_k_name=TOP_K_NAME, top_k_addr=TOP_K_ADDR))
+            del s1_c, s2_c, s3_c
+            gc.collect()
+
+        test_cands = pd.concat(test_parts, ignore_index=True)
+        print(f"  {time.time()-t0:.0f}s  cands={len(test_cands):,}  avg/S1={len(test_cands)/len(s1_te_ids):.1f}")
         test_cands.to_parquet(test_cands_cache, index=False)
-        del s2_te_blk, s3_te_blk
+        del test_parts, s1_te_ids
         gc.collect()
 
-    # ===== 8. Features test =====
+    # ===== 8. Features test (load s2/s3 one country at a time, build s23) =====
     print(f"\n[{ts()}] [FEAT-TEST] Loading S1/S2/S3 for features…")
     s1_te_ft = pd.read_parquet(norm["s1_te"], columns=FEAT_COLS)
     s2_te_ft = pd.read_parquet(norm["s2_te"], columns=FEAT_COLS)
